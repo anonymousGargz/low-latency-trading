@@ -1,0 +1,6 @@
+[dependencies]
+hdrhistogram = "7"
+
+[profile.release]
+opt-level = 3
+debug = true  # keep symbols for perf later
