@@ -1,7 +1,9 @@
-use std::net::UdpSocket;
-use std::collections::{BTreeMap, VecDeque, HashMap};
-use std::collections::{BTreeMap, VecDeque, HashMap};
 use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::UdpSocket;
+use std::time::Instant;
+
+use hdrhistogram::Histogram;
 
 #[derive(Debug, Clone)]
 pub struct Order {
@@ -35,10 +37,12 @@ impl OrderBook {
 
                 let queue = self.asks.get_mut(&best).unwrap();
                 let traded_qty;
+                let resting_id;
                 let mut remove_order_id = None;
 
                 {
                     let resting = queue.front_mut().unwrap();
+                    resting_id = resting.id;
                     traded_qty = qty.min(resting.qty);
                     resting.qty -= traded_qty;
                     if resting.qty == 0 {
@@ -48,6 +52,11 @@ impl OrderBook {
 
                 qty -= traded_qty;
 
+                println!(
+                    "trade: buy_id={} sell_id={} price={} qty={}",
+                    id, resting_id, best, traded_qty
+                );
+
                 if let Some(filled_id) = remove_order_id {
                     queue.pop_front();
                     self.order_index.remove(&filled_id);
@@ -55,8 +64,6 @@ impl OrderBook {
                         self.asks.remove(&best);
                     }
                 }
-
-                // TODO: emit a "trade executed" event here (id vs filled_id, price=best, qty=traded_qty)
             }
 
             if qty > 0 {
@@ -75,10 +82,12 @@ impl OrderBook {
 
                 let queue = self.bids.get_mut(&Reverse(best)).unwrap();
                 let traded_qty;
+                let resting_id;
                 let mut remove_order_id = None;
 
                 {
                     let resting = queue.front_mut().unwrap();
+                    resting_id = resting.id;
                     traded_qty = qty.min(resting.qty);
                     resting.qty -= traded_qty;
                     if resting.qty == 0 {
@@ -88,6 +97,11 @@ impl OrderBook {
 
                 qty -= traded_qty;
 
+                println!(
+                    "trade: sell_id={} buy_id={} price={} qty={}",
+                    id, resting_id, best, traded_qty
+                );
+
                 if let Some(filled_id) = remove_order_id {
                     queue.pop_front();
                     self.order_index.remove(&filled_id);
@@ -95,8 +109,6 @@ impl OrderBook {
                         self.bids.remove(&Reverse(best));
                     }
                 }
-
-                // TODO: emit a "trade executed" event here
             }
 
             if qty > 0 {
@@ -128,30 +140,6 @@ impl OrderBook {
     }
 }
 
-pub struct OrderBook {
-    pub bids: BTreeMap<i64, VecDeque<Order>>, // Dictionaary that stays sorted by key automatically; highest price first (reverse iteration)
-    pub asks: BTreeMap<i64, VecDeque<Order>>, // lowest price first
-    pub order_index: HashMap<u64, (i64, u8)>, // O(1) lookup- order_id -> (price, side), for cancels
-}
-
-#[derive(Debug, Clone)]
-pub struct Order {
-    pub id: u64,
-    pub qty: u32,
-}
-
-//NAIIVE UDP RECIEVER
-fn main() -> std::io::Result<()> {
-    let socket = UdpSocket::bind("127.0.0.1:9000")?;
-    let mut buf = [0u8; 1024];
-
-    loop {
-        let (len, _src) = socket.recv_from(&mut buf)?;
-        let msg = parse_order_msg(&buf[..len]);
-        // hand off to order book
-    }
-}
-
 //Define the wire format(simple binary UDP message format for order events)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -162,4 +150,51 @@ pub struct OrderMsg {
     pub side: u8,        // 0 = buy, 1 = sell
     pub kind: u8,        // 0 = new, 1 = cancel
     pub _pad: [u8; 2],
+}
+
+fn parse_order_msg(buf: &[u8]) -> OrderMsg {
+    OrderMsg {
+        order_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        price: i64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        qty: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+        side: buf[20],
+        kind: buf[21],
+        _pad: [buf[22], buf[23]],
+    }
+}
+
+//NAIIVE UDP RECIEVER
+fn main() -> std::io::Result<()> {
+    let socket = UdpSocket::bind("127.0.0.1:9000")?;
+    let mut buf = [0u8; 1024];
+    let mut book = OrderBook::new();
+    let mut hist = Histogram::<u64>::new_with_bounds(1, 1_000_000, 3).unwrap();
+    hist.auto(true);
+    let mut count: u64 = 0;
+
+    loop {
+        let (len, _src) = socket.recv_from(&mut buf)?;
+        let t0 = Instant::now();
+        let msg = parse_order_msg(&buf[..len]);
+        println!(
+            "order_id={} side={} price={} qty={}",
+            msg.order_id, msg.side, msg.price, msg.qty
+        );
+        book.add_order(msg.order_id, msg.price, msg.qty, msg.side);
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        hist.record(elapsed_ns).unwrap();
+        count += 1;
+
+        if count % 10_000 == 0 {
+            println!(
+                "latency ns: p50={} p95={} p99={} p99.9={} max={} (n={})",
+                hist.value_at_percentile(50.0),
+                hist.value_at_percentile(95.0),
+                hist.value_at_percentile(99.0),
+                hist.value_at_percentile(99.9),
+                hist.max(),
+                count,
+            );
+        }
+    }
 }
